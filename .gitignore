@@ -1,0 +1,120 @@
+# ---- Python 基本 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# 虛擬環境
+.venv/
+venv/
+.env/
+.envrc
+
+# Jupyter / 開發暫存
+.ipynb_checkpoints/
+*.ipynb
+
+# 編譯與封裝產物
+build/
+dist/
+*.egg-info/
+*.egg
+
+# 日誌與暫存
+logs/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# 測試/覆蓋率
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# IDE / 編輯器
+.vscode/
+.idea/
+
+# 型別/靜態分析暫存
+.pyre/
+.pytype/
+
+############################################################
+# 模型與大型檔 (models/)
+# 策略：
+#  - 預設忽略全部模型檔案，避免將大型權重推送到 Git。
+#  - 允許保留最小可重建所需的 tokenizer / vocab / config / README 等 metadata。
+#  - 若要新增其他允許檔案，在下方反向規則加入即可。
+#  - 若改用 Git LFS 追蹤權重，請刪除相應忽略或以 .gitattributes 管理。
+############################################################
+models/*
+!models/**/                                # 重新開放子資料夾 (必要，否則下列 ! 規則無效)
+!models/**/config.json
+!models/**/tokenizer.json
+!models/**/tokenizer_config.json
+!models/**/special_tokens_map.json
+!models/**/merges.txt
+!models/**/vocab.json
+!models/**/vocab.txt
+!models/**/README.md
+!models/**/added_tokens.json
+# （可選）取消註解以保留：
+# !models/**/generation_config.json
+# !models/**/configuration.json
+
+# 常見大型權重/訓練狀態（以下列出僅為清晰；實際上已被 models/* 全球模式覆蓋）
+# 若未來要引入 Git LFS，可於 .gitattributes 改為：
+#   *.safetensors filter=lfs diff=lfs merge=lfs -text
+# 並刪除 / 調整這些忽略規則。
+models/**/model.safetensors
+models/**/pytorch_model.bin
+models/**/optimizer.pt
+models/**/training_args.bin
+models/**/scheduler.pt
+
+# 額外明確列出（確保 .gguf / 多種框架權重 / 轉換格式不會被誤白名單）：
+models/**/*.gguf
+models/**/*.ggml
+models/**/*.bin
+models/**/*.pt
+models/**/*.pth
+models/**/*.onnx
+models/**/*.ckpt
+models/**/*.safetensors
+
+# 如果有量化 / 分片命名例如：model-00001-of-00008.safetensors 亦會被上面規則涵蓋。
+
+# 提示：如需保留「極小測試用迷你權重」供單元測試，可建立 tests/fixtures/ 並放置 hash 或下載指令，而非直接提交模型檔。
+
+# 若要保留空資料夾：在該資料夾放置一個 .keep
+# 並在下方加入反向規則讓 .keep 不被忽略。
+!models/**/.keep
+!models/.keep
+
+# 快取文件
+cache/
+*.cache
+
+# 臨時資料輸出
+outputs/
+artifacts/
+checkpoints/
+
+# 環境/私密設定
+*.env
+.env.*
+secrets.*.json
+
+# 視覺化/分析輸出
+wandb/
+mlruns/
+
+# 專案特定：若 embedding 模型可重建，也可忽略其權重（已由上方規則涵蓋）
+# models/embedding/*/model.safetensors
+
+# Windows PowerShell 可能產生的臨時檔
+*.ps1.tmp
