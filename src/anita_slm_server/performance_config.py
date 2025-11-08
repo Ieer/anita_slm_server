@@ -41,8 +41,8 @@ def get_optimal_batch_size(available_memory_gb: float, model_size_gb: float, tex
 
 def should_use_quantization(available_memory_gb: float) -> str | None:
 	"""根據可用記憶體回傳建議量化等級."""
-	if available_memory_gb < 4.0:
+	if available_memory_gb < 4.0:  # noqa: PLR2004
 		return "4bit"
-	elif available_memory_gb < 8.0:
+	elif available_memory_gb < 8.0:  # noqa: PLR2004
 		return "8bit"
 	return None

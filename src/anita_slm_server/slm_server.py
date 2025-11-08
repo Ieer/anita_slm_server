@@ -1,6 +1,9 @@
 """Full server implementation for SLM API compatible with QwenChat.
 
-啟動命令:
+建議啟動命令（避免 Windows 啟動器錯誤）：
+	python -m uvicorn src.anita_slm_server.slm_server:app --host 127.0.0.1 --port 8000
+
+或使用 uvicorn（需確認 uvicorn 安裝在當前 venv 並指向正確 Python）：
 	uvicorn src.anita_slm_server.slm_server:app --host 127.0.0.1 --port 8000
 """
 
@@ -13,6 +16,7 @@ import asyncio
 import base64
 import contextlib
 import gc
+import importlib.util
 import logging
 import math
 import os
@@ -25,6 +29,7 @@ import json
 from array import array
 from dataclasses import dataclass
 from pathlib import Path
+import platform
 from typing import Any, Literal, Protocol, cast
 
 from fastapi import FastAPI, HTTPException, Response, Request
@@ -184,6 +189,221 @@ class _MainModelState:
 
 MODEL_STATE = _MainModelState()
 qwen_init_lock = threading.Lock()
+
+
+class _TransformersBackendWrapper:
+	def __init__(self, inner: QwenChatAPI):
+		self.inner = inner
+		self.capabilities: dict[str, bool] | None = {
+			"tools": True,
+			"tool_choice": True,
+			"max_input_tokens": True,
+			"repetition_penalty": True,
+			"stream": False,
+		}
+
+	def generate(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+		max_new_tokens = kwargs.get("max_new_tokens", 256)
+		temperature = kwargs.get("temperature", 0.7)
+		top_p = kwargs.get("top_p", 0.9)
+		repetition_penalty = kwargs.get("repetition_penalty", 1.1)
+		tools = kwargs.get("tools")
+		tool_choice = kwargs.get("tool_choice")
+		max_input_tokens = kwargs.get("max_input_tokens")
+		result = self.inner.chat_messages(
+			messages=messages,
+			max_new_tokens=max_new_tokens,
+			temperature=temperature,
+			top_p=top_p,
+			repetition_penalty=repetition_penalty,
+			tools=tools,
+			tool_choice=tool_choice,
+			max_input_tokens=max_input_tokens,
+			return_usage=True,
+		)
+		return {
+			"text": result.text,
+			"prompt_tokens": result.prompt_tokens,
+			"completion_tokens": result.prompt_tokens if getattr(result, "completion_tokens", None) is None else result.completion_tokens,
+			"total_tokens": result.total_tokens,
+		}
+
+
+def _build_transformers_backend(env_cfg: dict[str, Any]) -> _TransformersBackendWrapper:
+	quantization = env_cfg.get("MODEL_QUANTIZATION")
+	if isinstance(quantization, str) and not quantization.strip():
+		quantization = None
+	global_seed = env_cfg.get("GLOBAL_SEED")
+	if isinstance(global_seed, str):
+		global_seed = int(global_seed) if global_seed.strip().isdigit() else None
+	device_map = env_cfg.get("MODEL_DEVICE_MAP", "auto")
+	if isinstance(device_map, str) and device_map.lower() in {"", "none"}:
+		device_map = None
+	dtype = env_cfg.get("TORCH_DTYPE", "auto")
+	if isinstance(dtype, str) and not dtype:
+		dtype = "auto"
+	low_cpu_mem_usage = env_cfg.get("LOW_CPU_MEM_USAGE", True)
+	if isinstance(low_cpu_mem_usage, str):
+		low_cpu_mem_usage = low_cpu_mem_usage.lower() in {"1", "true", "yes"}
+	config = QwenChatConfig(
+		model_path=str(env_cfg.get("MODEL_PATH", ENV["MODEL_PATH"])),
+		device_map=device_map,
+		dtype=dtype,
+		quantization=quantization,
+		compile_model=bool(env_cfg.get("COMPILE_MODEL", False)),
+		max_input_tokens=int(env_cfg.get("MAX_INPUT_TOKENS", ENV["MAX_INPUT_TOKENS"])),
+		default_system_prompt=env_cfg.get("DEFAULT_SYSTEM_PROMPT"),
+		global_seed=global_seed,
+		low_cpu_mem_usage=bool(low_cpu_mem_usage),
+	)
+	backend_obj = QwenChatAPI(config)
+	return _TransformersBackendWrapper(backend_obj)
+
+
+def _is_memory_related_error(message: str) -> bool:
+	lower = message.lower()
+	return (
+		"1455" in lower
+		or "page file" in lower
+		or "pagefile" in lower
+		or "頁面文件" in lower
+		or "页面文件" in message
+		or ("memory" in lower and any(token in lower for token in ("fail", "error", "insufficient", "unable", "not enough", "allocate")))
+	)
+
+
+def _bitsandbytes_available() -> bool:
+	with contextlib.suppress(Exception):
+		return importlib.util.find_spec("bitsandbytes") is not None
+	return False
+
+
+def _locate_gguf_model() -> str | None:
+	if env_override := os.getenv("GGUF_MODEL_PATH"):
+		override_path = Path(env_override).expanduser()
+		if override_path.is_file():
+			return str(override_path)
+	model_path = ENV.get("MODEL_PATH")
+	if isinstance(model_path, str):
+		current = Path(model_path)
+		if current.is_file() and current.suffix.lower() == ".gguf":
+			return str(current)
+		candidates = [current.parent / "Qwen2.5-0.5B-Instruct-GGUF"]
+	else:
+		candidates = []
+	candidates.extend(
+		[
+			Path("models/qwen/Qwen2.5-0.5B-Instruct-GGUF"),
+			Path("models/Qwen2.5-0.5B-Instruct-GGUF"),
+			Path("models/qwen"),
+		]
+	)
+	for candidate in candidates:
+		if candidate.is_file() and candidate.suffix.lower() == ".gguf":
+			return str(candidate)
+		if candidate.is_dir():
+			for item in candidate.glob("*.gguf"):
+				return str(item)
+	return None
+
+
+def _prepare_env_for_plan(overrides: dict[str, Any]) -> dict[str, Any]:
+	env_cfg = dict(ENV)
+	env_cfg.update(overrides)
+	if "MODEL_PATH" in env_cfg and env_cfg["MODEL_PATH"] is not None:
+		env_cfg["MODEL_PATH"] = str(env_cfg["MODEL_PATH"])
+	else:
+		env_cfg["MODEL_PATH"] = str(ENV["MODEL_PATH"])
+	return env_cfg
+
+
+def _load_backend_with_env(backend_name: str, env_cfg: dict[str, Any], load_kwargs: dict[str, Any] | None = None) -> _BackendProto:
+	if load_kwargs is None:
+		load_kwargs = {}
+	if backend_name == "transformers":
+		return cast(_BackendProto, _build_transformers_backend(env_cfg))
+	return cast(
+		_BackendProto,
+		load_backend(
+			model_path=str(env_cfg["MODEL_PATH"]),
+			backend=backend_name,
+			**load_kwargs,
+		),
+	)
+
+
+def _record_successful_plan(env_cfg: dict[str, Any], backend_name: str) -> None:
+	globals()["MODEL_BACKEND"] = backend_name
+	ENV.update(env_cfg)
+	os.environ["MODEL_BACKEND"] = backend_name
+	for key in ("MODEL_PATH", "MODEL_QUANTIZATION", "COMPILE_MODEL", "MAX_INPUT_TOKENS", "TORCH_DTYPE", "MODEL_DEVICE_MAP", "LOW_CPU_MEM_USAGE"):
+		if key not in env_cfg:
+			continue
+		value = env_cfg[key]
+		if value is None:
+			with contextlib.suppress(KeyError):
+				del os.environ[key]
+		elif isinstance(value, bool):
+			os.environ[key] = "1" if value else "0"
+		else:
+			os.environ[key] = str(value)
+
+
+def _build_memory_fallback_plans() -> list[dict[str, Any]]:
+	plans: list[dict[str, Any]] = []
+	if MODEL_BACKEND == "transformers":
+		if ENV.get("COMPILE_MODEL"):
+			plans.append(
+				{
+					"name": "disable torch.compile",
+					"backend": "transformers",
+					"overrides": {"COMPILE_MODEL": False},
+				}
+			)
+		is_windows = platform.system().lower().startswith("win")
+		quant_setting = ENV.get("MODEL_QUANTIZATION")
+		if not is_windows and (not quant_setting or str(quant_setting).lower() == "none") and _bitsandbytes_available():
+			plans.append(
+				{
+					"name": "enable 4bit quantization",
+					"backend": "transformers",
+					"overrides": {"MODEL_QUANTIZATION": "4bit", "COMPILE_MODEL": False},
+				}
+			)
+	gguf_path = _locate_gguf_model()
+	if gguf_path:
+		max_tokens = int(ENV.get("MAX_INPUT_TOKENS", 2048) or 2048)
+		max_tokens = max(256, min(max_tokens, 1024))
+		reduced_ctx_tokens = 512
+		batch_hint = max(32, min(128, max_tokens // 4))
+		plans.append(
+			{
+				"name": "switch to llama.cpp GGUF Q4_K_M",
+				"backend": "llama.cpp",
+				"overrides": {
+					"MODEL_PATH": gguf_path,
+					"MODEL_QUANTIZATION": None,
+					"COMPILE_MODEL": False,
+					"MAX_INPUT_TOKENS": max_tokens,
+				},
+				"load_kwargs": {"n_ctx": max_tokens, "n_batch": batch_hint},
+			}
+		)
+		if max_tokens > reduced_ctx_tokens:
+			plans.append(
+				{
+					"name": "llama.cpp GGUF Q4_K_M (reduced context)",
+					"backend": "llama.cpp",
+					"overrides": {
+						"MODEL_PATH": gguf_path,
+						"MODEL_QUANTIZATION": None,
+						"COMPILE_MODEL": False,
+						"MAX_INPUT_TOKENS": reduced_ctx_tokens,
+					},
+					"load_kwargs": {"n_ctx": reduced_ctx_tokens, "n_batch": 64},
+				}
+			)
+	return plans
 
 embedding_model_cache: dict[str, Any] = {}
 _embedding_last_used_times: dict[str, float] = {}
@@ -964,86 +1184,69 @@ def _init_backend_if_needed():
 	with qwen_init_lock:
 		if MODEL_STATE.backend is not None:
 			return
-		try:
-			app_logger.info(f"[backend-init] backend={MODEL_BACKEND} path={ENV['MODEL_PATH']}")
-			if MODEL_BACKEND == "transformers":
-				backend_obj = QwenChatAPI(
-					QwenChatConfig(
-						model_path=ENV["MODEL_PATH"],
-						device_map=ENV["MODEL_DEVICE_MAP"],
-						dtype=ENV["TORCH_DTYPE"],
-						quantization=ENV["MODEL_QUANTIZATION"],
-						compile_model=ENV["COMPILE_MODEL"],
-						max_input_tokens=ENV["MAX_INPUT_TOKENS"],
-						default_system_prompt=ENV["DEFAULT_SYSTEM_PROMPT"],
-						global_seed=ENV["GLOBAL_SEED"],
-						low_cpu_mem_usage=ENV["LOW_CPU_MEM_USAGE"],
-					)
-				)
-				class _Wrap:
-					def __init__(self, inner):
-						self.inner = inner
-						# expose capability hints for server-level discovery
-						self.capabilities = {
-							"tools": True,
-							"tool_choice": True,
-							"max_input_tokens": True,
-							"repetition_penalty": True,
-							"stream": False,
-						}
-					def generate(self, messages, **kwargs):
-						# Accept flexible kwargs to avoid signature explosion
-						max_new_tokens = kwargs.get("max_new_tokens", 256)
-						temperature = kwargs.get("temperature", 0.7)
-						top_p = kwargs.get("top_p", 0.9)
-						repetition_penalty = kwargs.get("repetition_penalty", 1.1)
-						tools = kwargs.get("tools")
-						tool_choice = kwargs.get("tool_choice")
-						max_input_tokens = kwargs.get("max_input_tokens")
-						r = self.inner.chat_messages(
-							messages=messages,
-							max_new_tokens=max_new_tokens,
-							temperature=temperature,
-							top_p=top_p,
-							repetition_penalty=repetition_penalty,
-							tools=tools,
-							tool_choice=tool_choice,
-							max_input_tokens=max_input_tokens,
-							return_usage=True,
+		plans: list[dict[str, Any]] = [
+			{
+				"name": "default configuration",
+				"backend": MODEL_BACKEND,
+				"overrides": {},
+			}
+		]
+		fallback_records: list[dict[str, str]] = []
+		memory_failure = False
+		idx = 0
+		while idx < len(plans):
+			plan = plans[idx]
+			backend_name = plan.get("backend", MODEL_BACKEND)
+			overrides = plan.get("overrides", {}) or {}
+			load_kwargs = plan.get("load_kwargs", {}) or {}
+			env_cfg = _prepare_env_for_plan(overrides)
+			attempt_name = plan.get("name", f"plan-{idx}")
+			app_logger.info(
+				f"[backend-init] attempt '{attempt_name}': backend={backend_name} path={env_cfg['MODEL_PATH']}"
+			)
+			try:
+				backend_instance = _load_backend_with_env(backend_name, env_cfg, load_kwargs)
+				_record_successful_plan(env_cfg, backend_name)
+				MODEL_STATE.backend = backend_instance  # type: ignore
+				MODEL_STATE.loaded_time = time.time()
+				app_logger.info(f"[backend-init] success via '{attempt_name}'")
+				return
+			except Exception as exc:  # noqa: BLE001
+				msg = str(exc)
+				fallback_records.append({"plan": attempt_name, "error": msg})
+				if idx == 0:
+					if _is_memory_related_error(msg):
+						memory_failure = True
+						app_logger.warning(
+							f"[backend-init] default configuration failed due to memory constraints: {msg}"
 						)
-						return {
-							"text": r.text,
-							"prompt_tokens": r.prompt_tokens,
-							"completion_tokens": r.prompt_tokens if getattr(r, 'completion_tokens', None) is None else r.completion_tokens,
-							"total_tokens": r.total_tokens,
-						}
-				backend_instance = _Wrap(backend_obj)
-			else:
-				backend_instance = load_backend(
-					model_path=ENV["MODEL_PATH"],
-					backend=MODEL_BACKEND,
-				)
-			MODEL_STATE.backend = backend_instance
-			MODEL_STATE.loaded_time = time.time()
-			app_logger.info("[backend-init] success")
-		except Exception as e:  # noqa: BLE001
-			msg = str(e)
-			lower = msg.lower()
-			app_logger.error(f"[backend-init] failed: {msg}")
-			if ("1455" in lower or "page file" in lower or "pagefile" in lower or "页面文件" in msg) or ("memory" in lower and "fail" in lower):
-				suggestion = {
-					"error": "模型/後端載入失敗 (內存或分頁檔不足)",
-					"backend": MODEL_BACKEND,
-					"original_error": msg,
-					"suggestions": [
-						"增大 Pagefile 至 >=16GB",
-						"嘗試 MODEL_BACKEND=llama.cpp + GGUF Q4_K_M",
-						"設定 MODEL_QUANTIZATION=4bit 並安裝 bitsandbytes",
-						"降低 MAX_INPUT_TOKENS 或關閉 COMPILE_MODEL",
-					],
-				}
-				raise HTTPException(status_code=503, detail=suggestion) from e
-			raise HTTPException(status_code=500, detail=f"後端載入失敗: {msg}") from e
+						fallback_plans = _build_memory_fallback_plans()
+						if fallback_plans:
+							plans.extend(fallback_plans)
+						else:
+							break
+					else:
+						app_logger.error(f"[backend-init] failed: {msg}")
+						raise HTTPException(status_code=500, detail=f"後端載入失敗: {msg}") from exc
+				else:
+					app_logger.warning(f"[backend-init] fallback '{attempt_name}' failed: {msg}")
+			idx += 1
+		if memory_failure:
+			suggestion = {
+				"error": "模型/後端載入失敗 (內存或分頁檔不足)",
+				"backend": MODEL_BACKEND,
+				"original_error": fallback_records[0]["error"] if fallback_records else "",
+				"auto_recovery_attempts": fallback_records[1:],
+				"suggestions": [
+					"增大 Pagefile 至 >=16GB",
+					"嘗試 MODEL_BACKEND=llama.cpp + GGUF Q4_K_M",
+					"設定 MODEL_QUANTIZATION=4bit 並安裝 bitsandbytes",
+					"降低 MAX_INPUT_TOKENS 或關閉 COMPILE_MODEL",
+				],
+			}
+			raise HTTPException(status_code=503, detail=suggestion) from None
+		last_error = fallback_records[-1]["error"] if fallback_records else "未能載入模型"
+		raise HTTPException(status_code=500, detail=f"後端載入失敗: {last_error}") from None
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionsResponse)
 async def chat_completions(req: ChatCompletionsRequest):

@@ -8,10 +8,11 @@
 """
 
 import contextlib
-from dataclasses import dataclass
 import gc
 import logging
 import time
+from dataclasses import dataclass
+
 import psutil
 
 _MIN_SNAPSHOTS_FOR_TREND = 2

@@ -6,6 +6,7 @@ sys.path.insert(0, r"e:\AI\anita_slm_server\src")
 
 print("Importing QwenChatAPI...", flush=True)
 from anita_slm_server.qwenchat import QwenChatAPI, QwenChatConfig  # noqa: E402
+
 print("QwenChatAPI imported", flush=True)
 
 cfg = QwenChatConfig()

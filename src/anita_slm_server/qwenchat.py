@@ -1,6 +1,6 @@
 import contextlib
-import os
 import inspect
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,7 +37,7 @@ class QwenChatConfig:
 
 
 class QwenChatAPI:
-    def __init__(self, config: QwenChatConfig | None = None, **legacy_kwargs) -> None:
+    def __init__(self, config: QwenChatConfig | None = None, **legacy_kwargs) -> None:  # noqa: PLR0912
         # Backward compatibility: allow passing old kwargs directly.
         if config is None:
             # Map legacy kwargs to config fields if provided, else environment defaults via QwenChatConfig().
@@ -73,7 +73,7 @@ class QwenChatAPI:
             model_kwargs[dtype_key] = torch_dtype
         if self.config.quantization:
             try:
-                from transformers import BitsAndBytesConfig
+                from transformers import BitsAndBytesConfig  # noqa: PLC0415
                 if self.config.quantization == "4bit":
                     model_kwargs["quantization_config"] = BitsAndBytesConfig(
                         load_in_4bit=True,
@@ -115,7 +115,7 @@ class QwenChatAPI:
         if self.global_seed is not None:
             torch.manual_seed(self.global_seed)
 
-    def build_generation_kwargs(self,
+    def build_generation_kwargs(self,  # noqa: PLR0913
                                 max_new_tokens: int,
                                 temperature: float,
                                 top_p: float,
@@ -201,18 +201,18 @@ class QwenChatAPI:
         kept = list(reversed(kept_rev))
         return [system_msg] + kept if system_msg is not None else kept
 
-    def chat_messages(self,
-                      messages: list[dict[str, Any]],
-                      max_new_tokens: int = 512,
-                      temperature: float = 0.7,
-                      top_p: float = 0.9,
-                      repetition_penalty: float = 1.1,
-                      seed: int | None = None,
-                      tools: list[dict[str, Any]] | None = None,
-                      tool_choice: Any | None = None,
-                      max_input_tokens: int | None = None,
-                      return_usage: bool = False,
-                      stop: list[str] | None = None) -> Any:
+    def chat_messages(self,  # noqa: PLR0913
+                    messages: list[dict[str, Any]],
+                    max_new_tokens: int = 512,
+                    temperature: float = 0.7,
+                    top_p: float = 0.9,
+                    repetition_penalty: float = 1.1,
+                    seed: int | None = None,
+                    tools: list[dict[str, Any]] | None = None,
+                    tool_choice: Any | None = None,
+                    max_input_tokens: int | None = None,
+                    return_usage: bool = False,
+                    stop: list[str] | None = None) -> Any:
         use_tools = tools if tools is not None else self.tools
         use_tool_choice = tool_choice if tool_choice is not None else self.tool_choice
         if self.default_system_prompt and (not messages or messages[0].get("role") != "system"):

@@ -7,9 +7,11 @@ This is intentionally lightweight and avoids any heavy optional import if not ne
 """
 from __future__ import annotations
 
+import contextlib
+import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-import os
+
 
 # Protocol definition -------------------------------------------------------
 class ChatBackend(Protocol):
@@ -107,22 +109,36 @@ def load_backend(
 ) -> ChatBackend:
     backend = backend.lower()
     if backend == "transformers":
-        from .qwenchat import QwenChatAPI  # local import to avoid heavy cost
+        from .qwenchat import QwenChatAPI  # local import to avoid heavy cost  # noqa: PLC0415
         qwen = QwenChatAPI(model_path=model_path, **kwargs)
         return TransformersBackend(qwen_api=qwen)
     elif backend in {"llama.cpp", "llamacpp", "llama"}:
         try:
-            from llama_cpp import Llama  # type: ignore
+            from llama_cpp import Llama  # type: ignore  # noqa: PLC0415
         except Exception as e:  # pragma: no cover
             raise RuntimeError("llama_cpp not installed. pip install llama-cpp-python") from e
         # Minimal sane defaults; allow override via kwargs
         n_ctx = int(os.getenv("LLAMA_CTX", os.getenv("MAX_INPUT_TOKENS", "1024")))
         n_threads = int(os.getenv("LLAMA_THREADS", "4"))
-        llm = Llama(
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-        )
+        n_batch_env = os.getenv("LLAMA_BATCH") or os.getenv("LLAMA_N_BATCH")
+        n_ubatch_env = os.getenv("LLAMA_UBATCH") or os.getenv("LLAMA_N_UBATCH")
+        llm_kwargs: dict[str, Any] = {
+            "model_path": model_path,
+            "n_ctx": n_ctx,
+            "n_threads": n_threads,
+        }
+        if n_batch_env:
+            with contextlib.suppress(ValueError):
+                n_batch_val = int(n_batch_env)
+                if n_batch_val > 0:
+                    llm_kwargs["n_batch"] = n_batch_val
+        if n_ubatch_env:
+            with contextlib.suppress(ValueError):
+                n_ubatch_val = int(n_ubatch_env)
+                if n_ubatch_val > 0:
+                    llm_kwargs["n_ubatch"] = n_ubatch_val
+        llm_kwargs.update(kwargs)
+        llm = Llama(**llm_kwargs)
         return LlamaCppBackend(llm=llm)
     else:  # pragma: no cover
         raise ValueError(f"Unsupported MODEL_BACKEND: {backend}")

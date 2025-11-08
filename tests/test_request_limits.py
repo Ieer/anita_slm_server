@@ -30,7 +30,7 @@ def _stub_backend(monkeypatch):
             }
 
     monkeypatch.setattr(slm, "_init_backend_if_needed", lambda: None)
-    slm.MODEL_STATE.backend = _DummyBackend()
+    slm.MODEL_STATE.backend = _DummyBackend() # type: ignore
     slm.MODEL_STATE.loaded_time = time.time()
     slm.MODEL_STATE.last_used_time = time.time()
     yield

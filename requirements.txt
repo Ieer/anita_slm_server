@@ -28,5 +28,7 @@ openai>=1.0.0
 # Windows 若遇到編譯問題，可先嘗試:
 #   pip install --upgrade pip
 #   pip install llama-cpp-python --extra-index-url https://jllllll.github.io/llama-cpp-python-cuBLAS-wheels
-# 或使用官方預編譯 (若已提供)；CPU 版本可直接:
+#   安装 CPU 版预编译轮子，请使用：
+#   pip install --no-cache-dir --prefer-binary llama-cpp-python==0.2.90 `--index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+# 或使用官方預編譜 (若已提供)；CPU 版本可直接:
 #   pip install llama-cpp-python

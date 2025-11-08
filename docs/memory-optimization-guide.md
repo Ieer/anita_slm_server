@@ -63,6 +63,24 @@ export MAX_INPUT_TOKENS=2048
 export MAX_INPUT_CHARS=12000
 ```
 
+### 2.5 llama.cpp / GGUF 後端
+
+若系統自動回退至 `llama.cpp`（GGUF 模型），或您手動設定 `MODEL_BACKEND=llama.cpp`，可透過以下變數細調記憶體配置：
+
+```bash
+# 上下文長度（預設同 MAX_INPUT_TOKENS，最多 1024）
+export LLAMA_CTX=1024
+
+# 設定每批推理 token 數，減少此值可降低 CPU 記憶體需求
+export LLAMA_BATCH=64        # 與舊版 LLAMA_N_BATCH 等價
+export LLAMA_UBATCH=32       # 與舊版 LLAMA_N_UBATCH 等價
+
+# 仍可使用 MAX_INPUT_TOKENS 控制對話最大長度
+export MAX_INPUT_TOKENS=768
+```
+
+> 提示：若遇到 Windows 的 1455 錯誤（頁面文件不足），先嘗試將 `LLAMA_BATCH` 調至 32 或 64，再重新啟動服務。
+
 ## 3. 啟動優化的服務
 
 配置環境變數後，正常啟動服務：
@@ -76,11 +94,13 @@ python -m uvicorn slm_server:app --host 127.0.0.1 --port 8001
 ## 4. 監控與診斷
 
 服務現在提供更詳細的日誌信息，包括：
+
 - 模型載入和卸載事件
 - 記憶體使用警告和錯誤
 - 模型量化狀態
 
 可以通過以下指標了解系統狀態：
+
 - `/metrics` 端點查看請求和錯誤統計
 - 伺服器日誌中的記憶體相關警告
 
@@ -125,3 +145,4 @@ export TORCH_NUM_THREADS=0  # 自動
 3. 確保沒有其他大型應用程序佔用記憶體
 4. 在 Windows 上，增加頁面文件大小
 5. 檢查是否已正確安裝 bitsandbytes 套件
+6. 若自動回退至 GGUF 仍失敗，將 `LLAMA_BATCH` 或 `LLAMA_CTX` 調低（例如 `LLAMA_BATCH=32`、`LLAMA_CTX=512`），並重新啟動服務
