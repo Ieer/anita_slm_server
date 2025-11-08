@@ -36,7 +36,7 @@ HTTP_OK = 200
 
 def start_server() -> subprocess.Popen | None:
     print("啟動簡化版伺服器...")
-    cmd = [sys.executable, "-m", "uvicorn", "anita_slm_server.slm_server_simple:app","--host","127.0.0.1","--port","8001","--reload"]
+    cmd = [sys.executable, "-m", "uvicorn", "anita_slm_server.slm_server:app","--host","127.0.0.1","--port","8001","--reload"]
     try:
         proc = subprocess.Popen(cmd)
         for i in range(30):

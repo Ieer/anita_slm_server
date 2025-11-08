@@ -6,7 +6,7 @@ from pydantic import BaseModel
 import numpy as np
 
 # 設定 API 端點
-API_BASE_URL = "http://127.0.0.1:8001/v1"  # 恢復為端口 8001
+API_BASE_URL = "http://127.0.0.1:8000/v1"  # 恢復為端口 8000
 
 # --- 系統環境檢測和資源估算函數 ---
 def get_system_memory_info() -> Dict[str, float]:

@@ -187,15 +187,23 @@ def get_gpu_memory_status() -> list[dict[str, float | int | str]]:
 	return _collect_gpu_memory_status()
 
 
+@contextlib.contextmanager
 def memory_tracking(monitor: MemoryMonitor, operation_name: str = "operation"):
-	"""簡易 context manager：追蹤區塊前後程序記憶體差異。"""
+	"""簡易 context manager：追蹤區塊前後程序記憶體差異。
+
+	使用方式:
+		with memory_tracking(_global_monitor, "embedding-encode"):
+			...
+	"""
 	before = monitor.take_snapshot()
 	start = time.time()
-	yield monitor
-	after = monitor.take_snapshot()
-	duration = time.time() - start
-	delta = after.process_memory_gb - before.process_memory_gb
-	if delta > _MEMORY_DELTA_LOG_THRESHOLD_GB:
-		logger.info(
-			f"{operation_name} 內存使用情況: 增長 {delta:.2f}GB, 耗時 {duration:.1f}s"
-		)
+	try:
+		yield monitor
+	finally:
+		after = monitor.take_snapshot()
+		duration = time.time() - start
+		delta = after.process_memory_gb - before.process_memory_gb
+		if delta > _MEMORY_DELTA_LOG_THRESHOLD_GB:
+			logger.info(
+				f"{operation_name} 內存使用情況: 增長 {delta:.2f}GB, 耗時 {duration:.1f}s"
+			)

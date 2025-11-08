@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import platform
 from typing import Any, Literal, Protocol, cast
+from functools import lru_cache
 
 from fastapi import FastAPI, HTTPException, Response, Request
 from fastapi.responses import JSONResponse
@@ -77,6 +78,14 @@ ENV = {
 	"MAX_EMBEDDING_INPUTS": int(os.getenv("MAX_EMBEDDING_INPUTS", "32")),
 	"MAX_EMBEDDING_TOTAL_CHARS": int(os.getenv("MAX_EMBEDDING_TOTAL_CHARS", "20000")),
 	"MAX_EMBEDDING_ITEM_CHARS": int(os.getenv("MAX_EMBEDDING_ITEM_CHARS", "8000")),
+	# Embedding pipeline tuning
+	"EMBEDDING_BATCH_SIZE": int(os.getenv("EMBEDDING_BATCH_SIZE", "16")),
+	# Adaptive resource controls
+	"ADAPTIVE_LIMITS": os.getenv("ADAPTIVE_LIMITS", "1") in {"1", "true", "TRUE", "True"},
+	"ADAPTIVE_INTERVAL": int(os.getenv("ADAPTIVE_INTERVAL", "30")),
+	"ADAPTIVE_HIGH": float(os.getenv("ADAPTIVE_HIGH", "0.82")),
+	"ADAPTIVE_CRITICAL": float(os.getenv("ADAPTIVE_CRITICAL", "0.90")),
+	"DEGRADE_TO_GGUF": os.getenv("DEGRADE_TO_GGUF", "1") in {"1", "true", "TRUE", "True"},
 	# Security and middleware (all optional; disabled by default)
 	"REQUIRE_API_KEY": os.getenv("REQUIRE_API_KEY", "0") in {"1", "true", "TRUE", "True"},
 	"API_KEY": os.getenv("API_KEY"),
@@ -370,8 +379,7 @@ def _build_memory_fallback_plans() -> list[dict[str, Any]]:
 					"overrides": {"MODEL_QUANTIZATION": "4bit", "COMPILE_MODEL": False},
 				}
 			)
-	gguf_path = _locate_gguf_model()
-	if gguf_path:
+	if gguf_path := _locate_gguf_model():
 		max_tokens = int(ENV.get("MAX_INPUT_TOKENS", 2048) or 2048)
 		max_tokens = max(256, min(max_tokens, 1024))
 		reduced_ctx_tokens = 512
@@ -429,6 +437,7 @@ _metrics: dict[str, float] = {
 	"queue_timeout_total": 0.0,
 	"queue_wait_time_sum_seconds": 0.0,
 	"queue_wait_time_count": 0.0,
+	"embedding_fallbacks_total": 0.0,
 }
 
 def _metrics_inc(key: str, val: float = 1.0):
@@ -476,18 +485,43 @@ class _RequestLimiter:
 		self._semaphore = asyncio.Semaphore(self._max_concurrent)
 		self._lock = asyncio.Lock()
 		self._waiting = 0
+		# dynamic ceilings default to static
+		self._dyn_max_concurrent = self._max_concurrent
+		self._dyn_max_pending = self._max_pending
+
+	def _active(self) -> int:
+		available = int(getattr(self._semaphore, "_value", 0) or 0)
+		return max(0, self._max_concurrent - available)
+
+	async def set_dynamic_limits(self, max_concurrent: int | None = None, max_pending: int | None = None) -> None:
+		async with self._lock:
+			if max_concurrent is not None:
+				self._dyn_max_concurrent = max(1, min(self._max_concurrent, int(max_concurrent)))
+			if max_pending is not None:
+				self._dyn_max_pending = max(0, min(self._max_pending, int(max_pending)))
 
 	async def _acquire(self) -> None:
 		start = time.perf_counter()
 		async with self._lock:
 			available = getattr(self._semaphore, "_value", 0)
-			if self._max_pending == 0 and available <= 0:
+			# enforce dynamic pending cap
+			if self._dyn_max_pending == 0 and available <= 0:
 				raise _QueueFullError("request queue is full")
-			if self._max_pending > 0 and self._waiting >= self._max_pending:
+			if self._dyn_max_pending > 0 and self._waiting >= self._dyn_max_pending:
 				raise _QueueFullError("request queue is full")
 			self._waiting += 1
 		try:
-			await asyncio.wait_for(self._semaphore.acquire(), timeout=self._timeout)
+			deadline = start + self._timeout
+			# pre-wait until under dynamic concurrent cap
+			while True:
+				active = self._active()
+				if active < self._dyn_max_concurrent:
+					break
+				remaining = deadline - time.perf_counter()
+				if remaining <= 0:
+					raise _QueueTimeoutError("request queue wait timed out")
+				await asyncio.sleep(min(0.05, remaining))
+			await asyncio.wait_for(self._semaphore.acquire(), timeout=max(0.0, deadline - time.perf_counter()))
 			wait_time = time.perf_counter() - start
 			_metrics_observe_queue_wait(wait_time)
 		except asyncio.TimeoutError as exc:
@@ -513,6 +547,14 @@ class _RequestLimiter:
 	@property
 	def max_pending(self) -> int:
 		return self._max_pending
+
+	@property
+	def dyn_max_concurrent(self) -> int:
+		return self._dyn_max_concurrent
+
+	@property
+	def dyn_max_pending(self) -> int:
+		return self._dyn_max_pending
 
 	@property
 	def timeout(self) -> float:
@@ -654,7 +696,7 @@ def _extracted_from_unload_models_if_idle_11(idle_seconds):
 	app_logger.info("主模型已成功卸載")
 
 @app.on_event("startup")
-async def startup_tasks():
+async def startup_tasks():  # noqa: PLR0915
 	mapping = get_embedding_model_map(force=True)
 	app_logger.info(f"可用 embedding 模型: {list(mapping.keys())}")
 	app_logger.info(f"預設 embedding 模型: {DEFAULT_EMBEDDING_MODEL_ID}")
@@ -684,6 +726,53 @@ async def startup_tasks():
 				app_logger.error(f"模型卸載監控錯誤: {e}")
 		asyncio.get_event_loop().create_task(model_unload_monitor())
 
+	# Adaptive resource-based limiter and optional backend degrade
+	if ENV.get("ADAPTIVE_LIMITS"):
+		async def resource_manager():
+			critical_hits = 0
+			degraded_once = False
+			interval = int(ENV.get("ADAPTIVE_INTERVAL", 30) or 30)
+			while True:
+				await asyncio.sleep(interval)
+				status = get_memory_status()
+				usage = 1.0
+				with contextlib.suppress(Exception):
+					usage = float(status.get("current_usage_percent", 1.0)) # type: ignore
+				if usage >= float(ENV.get("ADAPTIVE_CRITICAL", 0.90)):
+					target_conc = max(1, REQUEST_LIMITER.max_concurrent // 4)
+					target_pending = 0
+					critical_hits += 1
+				elif usage >= float(ENV.get("ADAPTIVE_HIGH", 0.82)):
+					target_conc = max(1, REQUEST_LIMITER.max_concurrent // 2)
+					target_pending = max(0, REQUEST_LIMITER.max_pending // 2)
+					critical_hits = 0
+				else:
+					target_conc = REQUEST_LIMITER.max_concurrent
+					target_pending = REQUEST_LIMITER.max_pending
+					critical_hits = 0
+				await REQUEST_LIMITER.set_dynamic_limits(target_conc, target_pending)
+				app_logger.debug(f"[adaptive] mem={usage:.1%} dyn_limits: conc={REQUEST_LIMITER.dyn_max_concurrent} pending={REQUEST_LIMITER.dyn_max_pending}")
+				# optional degrade to GGUF when sustained critical
+				if (not degraded_once) and ENV.get("DEGRADE_TO_GGUF") and critical_hits >= 3:
+					gguf_path = _locate_gguf_model()
+					if gguf_path and globals().get("MODEL_BACKEND") == "transformers":
+						if REQUEST_LIMITER.waiting == 0 and REQUEST_LIMITER._active() == 0:
+							app_logger.warning("[adaptive] Sustained critical memory. Switching backend to llama.cpp GGUF.")
+							with qwen_init_lock:
+								globals()["MODEL_BACKEND"] = "llama.cpp"
+								os.environ["MODEL_BACKEND"] = "llama.cpp"
+								ENV["MODEL_PATH"] = gguf_path
+								os.environ["MODEL_PATH"] = gguf_path
+								MODEL_STATE.backend = None
+								MODEL_STATE.loaded_time = None
+								MODEL_STATE.last_used_time = None
+								gc.collect()
+								with contextlib.suppress(Exception):
+									if torch and torch.cuda.is_available():
+										torch.cuda.empty_cache()
+								degraded_once = True
+		asyncio.get_event_loop().create_task(resource_manager())
+
 class ReloadEmbeddingsResponse(BaseModel):
 	refreshed: bool
 	models: list[str]
@@ -712,6 +801,10 @@ def _count_tokens(text: str) -> int:
 		with contextlib.suppress(Exception):
 			return len(_tiktoken_enc.encode(text))
 	return max(1, math.ceil(len(text) / 4))
+
+@lru_cache(maxsize=8192)
+def _count_tokens_cached(text: str) -> int:
+	return _count_tokens(text)
 
 def _truncate_messages_by_tokens(messages: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
 	if limit is None or limit <= 0:
@@ -1098,6 +1191,7 @@ def _process_embedding_request(req: EmbeddingsRequest, inputs: list[str]) -> Emb
 					embedding_model_cache[model_key] = model_obj
 				except Exception as e:  # noqa: BLE001
 					_metrics_inc("errors_total")
+					app_logger.exception(f"[embedding-load] 模型載入失敗 {model_key}: {e}")
 					raise HTTPException(status_code=500, detail=f"嵌入模型載入失敗: {e}") from e
 	current_device = getattr(model_obj, "device", None)
 	if target_device and current_device != target_device and hasattr(model_obj, "to"):
@@ -1116,13 +1210,49 @@ def _process_embedding_request(req: EmbeddingsRequest, inputs: list[str]) -> Emb
 		values = vec.tolist() if hasattr(vec, "tolist") else list(vec)
 		return [float(v) for v in values]
 
+	def _encode_with_fallbacks(texts: list[str]) -> Any:
+		"""Try encode with current device/batch, fallback on OOM: reduce batch, then CPU."""
+		batch = int(ENV.get("EMBEDDING_BATCH_SIZE", 16) or 16)
+		attempts = []
+		# 1) current device, configured batch
+		attempts.append((target_device, batch))
+		# 2) current device, smaller batch
+		attempts.append((target_device, max(1, batch // 2)))
+		# 3) cpu device, small batch
+		attempts.append(("cpu", min(8, max(1, batch // 2))))
+		last_err: Exception | None = None
+		for dev, bsz in attempts:
+			try:
+				if getattr(model_obj, "device", None) != dev and hasattr(model_obj, "to"):
+					with contextlib.suppress(Exception):
+						model_obj.to(dev)
+				return model_obj.encode(texts, batch_size=bsz)
+			except Exception as e:  # noqa: BLE001
+				msg = str(e).lower()
+				if "out of memory" in msg or "page file" in msg or "1455" in msg or "cannot allocate" in msg:
+					_metrics_inc("embedding_fallbacks_total")
+					last_err = e
+					continue
+				else:
+					raise
+		if last_err is not None:
+			raise last_err
+		return None
+
 	try:
-		vectors = model_obj.encode(inputs)
+		vectors = _encode_with_fallbacks(inputs)
 		data_items = [EmbeddingDataItem(index=i, embedding=_serialize_vector(vec)) for i, vec in enumerate(vectors)]
-		usage = ChatUsage(prompt_tokens=len(str(inputs)), total_tokens=len(str(inputs)))
+		# 改善 usage 統計：以 token 粗估輸入成本，避免使用 len(str(inputs)) 誤導。
+		# completion_tokens 對 embeddings 無意義，保持為 0。
+		prompt_token_estimate = 0
+		for text in inputs:
+			if isinstance(text, str):
+				prompt_token_estimate += _count_tokens_cached(text)
+		usage = ChatUsage(prompt_tokens=prompt_token_estimate, completion_tokens=0, total_tokens=prompt_token_estimate)
 		return EmbeddingsResponse(data=data_items, model=model_key, usage=usage)
 	except Exception as e:  # noqa: BLE001
 		_metrics_inc("errors_total")
+		app_logger.exception(f"[embeddings] 生成失敗 model={model_key}: {e}")
 		raise HTTPException(status_code=500, detail=f"嵌入生成失敗: {e}") from e
 
 @app.get("/v1/models")
@@ -1149,7 +1279,7 @@ def _current_backend_capabilities() -> dict[str, bool]:
 	if be is not None:
 		c = getattr(be, "capabilities", None)
 		if isinstance(c, dict):
-			caps.update({k: bool(v) for k, v in c.items()})
+			caps |= {k: bool(v) for k, v in c.items()}
 	return caps
 
 @app.get("/v1/capabilities")
